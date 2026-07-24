@@ -1,0 +1,149 @@
+DROP TABLE IF EXISTS sandpit.fullprice_forecast_input_weekly;
+
+with convertedsales as (
+select g.*,
+   g.net_sls_incvat_amt * c.exchange_rate as usd_price
+   from full_price.global_sales_tran_dtl g
+   inner join full_price.currency_to_usd c on g.currency_cd = c.from_currency_cd
+),
+sales as (
+   select
+   WEEK_TRUNC_DAY(periodend_dt::DATE, 3) as week,
+   global_facility_key,
+   material_number,
+   material_number + '~' + global_facility_key as id,
+   sum(net_sls_qty) as sumofsales,
+   avg(usd_price / net_sls_qty) as averagesaleprice
+   from convertedsales
+   where net_sls_qty > 0
+   and net_sls_incvat_amt > 0
+   and non_mdse_flg != 'Y'
+   and periodend_dt::date between '2019-04-02' and '2022-09-07'
+   and material_number is not NULL
+   and material_number != ''
+   and material_number != 'GENERIC'
+   GROUP BY week, global_facility_key, material_number, id
+),
+eligibleproducts as (
+   SELECT distinct
+   id,
+   material_number,
+   global_facility_key,
+   count(*) as vol
+   from sales
+   group by id, material_number, global_facility_key
+   having vol > 20
+),
+calendar as (
+   select id,
+   material_number,
+   global_facility_key,
+   date,
+   t
+   from eligibleproducts
+   cross join sandpit.workflow_forecast_calendar_weekly
+),
+location as (
+   select DISTINCT
+   global_facility_key,
+   geo_latitude,
+   geo_longitude,
+   country_name
+   from full_price.retail_stores
+),
+perlocation as (
+   select distinct global_facility_key,
+   material_number,
+   max(usd_price) as maxprice
+   from convertedsales
+   where net_sls_qty = 1
+   and net_sls_incvat_amt > 0
+   group by global_facility_key, material_number
+),
+locationinfo as (
+   select p.*,
+   r.country_name
+   from perlocation p
+   left join full_price.retail_stores r
+   on p.global_facility_key = r.global_facility_key
+),
+msrptable as (
+   select DISTINCT country_name,
+   material_number,
+   ROUND(max(maxprice),2) as msrp
+   from locationinfo
+   group by country_name, material_number
+),
+soldproduct as (
+   select distinct material_number
+   from full_price.global_sales_tran_dtl
+   where net_sls_qty > 0
+   and net_sls_incvat_amt > 0
+   and non_mdse_flg != 'Y'
+   and periodend_dt::date between '2019-04-02' and '2022-09-07'
+   and material_number is not NULL
+   and material_number != ''
+),
+productinfo as (
+   select *
+   from soldproduct s
+   join full_price.global_product g
+   on s.material_number = g.material_nbr
+),
+finalproduct as (
+   select distinct material_number,
+   color_desc as colorway,
+   plan_level1_name as globalplan1,
+   plan_level4_name as globalplan4,
+   plan_level5_name as globalplan5
+   from productinfo
+   where plan_level1_name is not null
+   and plan_level1_name not LIKE '%UNMAPPED%'
+),
+matnumber as (
+   select i.*,
+   g.material_nbr as material_number
+   from full_price.inventory_trim i
+   inner join full_price.global_product g on i.global_product_key = g.global_product_key
+),
+inventoryperweek as (
+   select WEEK_TRUNC_DAY(periodend_dt::DATE, 3) as week,
+   global_facility_key,
+   material_number,
+   max(eoh_qty) as stock_level
+   from matnumber
+   group by week, global_facility_key, material_number
+),
+avg_sales as (
+   SELECT
+   material_number,
+   global_facility_key,
+   AVG(sumofsales) AS avg_sales
+   FROM sales
+   GROUP BY material_number, global_facility_key
+)
+select c.date as date_week,
+c.t,
+DATE_PART(year, c.date::DATE) as year,
+c.id,
+c.material_number,
+c.global_facility_key as locationid,
+l.country_name,
+l.geo_latitude as latitude,
+l.geo_longitude as longitude,
+f.colorway,
+f.globalplan1,
+f.globalplan4,
+f.globalplan5,
+m.msrp,
+ROUND(((msrp - averagesaleprice) / msrp) * 100, 2) as discount_pct,
+COALESCE(sumofsales, 0) AS sold,
+COALESCE((i.stock_level / avs.avg_sales), 2) as inventory_ratio
+INTO sandpit.fullprice_forecast_input_weekly
+from calendar c
+left join sales s on c.id = s.id and c.date = s.week
+left join location l on c.global_facility_key = l.global_facility_key
+left join msrptable m on c.material_number = m.material_number and l.country_name = m.country_name
+left join finalproduct f on c.material_number = f.material_number
+left join inventoryperweek i on c.date = i.week and c.material_number = i.material_number and c.global_facility_key = i.global_facility_key
+left join avg_sales avs on c.material_number = avs.material_number and c.global_facility_key = avs.global_facility_key
